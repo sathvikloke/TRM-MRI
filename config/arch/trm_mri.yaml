@@ -1,0 +1,38 @@
+# config/arch/trm_mri.yaml
+#
+# Architecture config for TRM-MRI.
+# height and width default to fastMRI knee 320x320.
+# pretrain.py will overwrite them from dataset.json at runtime.
+
+name: recursive_reasoning.trm_mri@TinyRecursiveReasoningModel_MRI
+loss:
+  name: losses_mri@MRILossHead
+
+# ── ACT halting ──────────────────────────────────────────
+halt_exploration_prob: 0.1
+halt_max_steps: 16
+no_ACT_continue: True
+
+# ── TRM structure ────────────────────────────────────────
+H_cycles: 3
+L_cycles: 4
+H_layers: 0      # ignored in TRM (single shared module)
+L_layers: 2
+
+# ── Transformer ──────────────────────────────────────────
+hidden_size: 512
+num_heads: 8
+expansion: 4
+
+pos_encodings: rope
+forward_dtype: bfloat16
+
+# ── CNN encoder ──────────────────────────────────────────
+cnn_channels: 32
+
+# ── MRI spatial size (overridden by pretrain.py) ─────────
+height: 320
+width: 320
+
+# ── Disabled features ────────────────────────────────────
+puzzle_emb_ndim: 0    # no puzzle embeddings for MRI
