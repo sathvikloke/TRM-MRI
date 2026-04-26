@@ -27,8 +27,8 @@ hydra:
 data_paths: ['data/mri-knee']
 data_paths_test: []
 
-# No evaluators for MRI (ARC evaluator not applicable)
-evaluators: []
+# No evaluators for MRI (ARC evaluator not applicable).
+# Field intentionally omitted – PretrainConfig defaults handle the absence.
 
 # ── Training hyperparams ─────────────────────────────────────────────
 global_batch_size: 4
@@ -38,7 +38,10 @@ eval_interval: 5000
 checkpoint_every_eval: False
 
 lr: 1e-4
-lr_min_ratio: 1.0
+# Cosine LR decays to lr * lr_min_ratio. 1.0 disables decay entirely
+# (the schedule then becomes a flat line after warmup), so use 0.1 to
+# actually anneal the learning rate by 10× over training.
+lr_min_ratio: 0.1
 lr_warmup_steps: 500
 
 beta1: 0.9

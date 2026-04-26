@@ -175,18 +175,27 @@ class MRIDataset(IterableDataset):
         for i, path in enumerate(self.config.dataset_paths):
             key = "all" if i == 0 else f"all{i}"
             split_dir = os.path.join(path, self.split)
-            self._data[key] = {
+            arrays: Dict[str, np.ndarray] = {
                 "inputs": np.load(os.path.join(split_dir, "all__inputs.npy"), mmap_mode="r"),
                 "labels": np.load(os.path.join(split_dir, "all__labels.npy"), mmap_mode="r"),
                 "masks":  np.load(os.path.join(split_dir, "all__masks.npy"),  mmap_mode="r"),
             }
+            # Optional scales array (per-slice RSS max) — used by trm_mri.data_consistency
+            scales_path = os.path.join(split_dir, "all__scales.npy")
+            if os.path.exists(scales_path):
+                arrays["scales"] = np.load(scales_path, mmap_mode="r")
+            self._data[key] = arrays
 
-    def _collate(self, inputs: np.ndarray, labels: np.ndarray, masks: np.ndarray) -> Dict[str, torch.Tensor]:
-        return {
+    def _collate(self, inputs: np.ndarray, labels: np.ndarray, masks: np.ndarray,
+                 scales: Optional[np.ndarray] = None) -> Dict[str, torch.Tensor]:
+        batch: Dict[str, torch.Tensor] = {
             "inputs": torch.from_numpy(inputs.copy()).float(),
             "labels": torch.from_numpy(labels.copy()).float(),
             "masks":  torch.from_numpy(masks.copy()).float(),
         }
+        if scales is not None:
+            batch["scales"] = torch.from_numpy(scales.copy()).float()
+        return batch
 
     # ── Test iterator: sequential, complete coverage ─────────────────────
 
@@ -203,10 +212,12 @@ class MRIDataset(IterableDataset):
                 lo = start + self.config.rank * self.local_batch_size
                 hi = start + (self.config.rank + 1) * self.local_batch_size
 
+                scales_arr = dataset.get("scales")
                 batch = self._collate(
                     dataset["inputs"][lo:hi],
                     dataset["labels"][lo:hi],
                     dataset["masks"][lo:hi],
+                    scales=None if scales_arr is None else scales_arr[lo:hi],
                 )
                 yield set_name, batch, end - start
                 start += self.config.global_batch_size
@@ -232,10 +243,12 @@ class MRIDataset(IterableDataset):
                 hi = (self.config.rank + 1) * self.local_batch_size
                 local_idx = global_idx[lo:hi]
 
+                scales_arr = dataset.get("scales")
                 batch = self._collate(
                     dataset["inputs"][local_idx],
                     dataset["labels"][local_idx],
                     dataset["masks"][local_idx],
+                    scales=None if scales_arr is None else scales_arr[local_idx],
                 )
                 yield set_name, batch, self.config.global_batch_size
                 start += self.config.global_batch_size
@@ -373,26 +386,72 @@ def init_train_state(
 
 
 def _load_checkpoint(model: nn.Module, config: PretrainConfig) -> None:
+    """
+    Backwards-compatible checkpoint loader.
+
+    * New-style payload (saved by save_train_state above): a dict containing
+      a "model" key, plus optionally "optimizers", "ema", and "step".
+    * Legacy payload: a bare model state_dict.
+    """
     if config.load_checkpoint is None:
         return
     print(f"Loading checkpoint {config.load_checkpoint}")
     state = torch.load(config.load_checkpoint, map_location="cuda")
-    model.load_state_dict(state, assign=True)
+    if isinstance(state, dict) and "model" in state:
+        model.load_state_dict(state["model"], assign=True)
+    else:
+        model.load_state_dict(state, assign=True)
 
 
-def save_train_state(config: PretrainConfig, train_state: TrainState) -> None:
+def save_train_state(
+    config: PretrainConfig,
+    train_state: TrainState,
+    ema_helper: Optional[EMAHelper] = None,
+) -> None:
+    """
+    Save model weights + optimizer state + (optionally) EMA shadows so that
+    training can be resumed exactly.  The legacy "model state_dict only"
+    behaviour silently dropped optimizer momenta, EMA shadows, and the step
+    counter, which made resumed runs look like cold starts.
+    """
     if config.checkpoint_path is None:
         return
     os.makedirs(config.checkpoint_path, exist_ok=True)
+    payload: Dict[str, Any] = {
+        "model": train_state.model.state_dict(),
+        "optimizers": [opt.state_dict() for opt in train_state.optimizers],
+        "step": train_state.step,
+        "total_steps": train_state.total_steps,
+    }
+    if ema_helper is not None:
+        payload["ema"] = ema_helper.state_dict()
     torch.save(
-        train_state.model.state_dict(),
-        os.path.join(config.checkpoint_path, f"step_{train_state.step}"),
+        payload,
+        os.path.join(config.checkpoint_path, f"step_{train_state.step}.pt"),
     )
 
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Training step
 # ──────────────────────────────────────────────────────────────────────────────
+
+def _coalesced_all_reduce_grads(model: nn.Module) -> None:
+    """
+    All-reduce all parameter gradients in a single coalesced collective.
+    A per-parameter all_reduce loop creates O(num_params) collectives,
+    which is dramatically slower than one flatten + reduce + unflatten.
+    """
+    grads = [p.grad for p in model.parameters() if p.grad is not None]
+    if not grads:
+        return
+    # _flatten_dense_tensors / _unflatten_dense_tensors live in private API
+    # but are stable and used internally by torch.nn.parallel.
+    from torch._utils import _flatten_dense_tensors, _unflatten_dense_tensors
+    flat = _flatten_dense_tensors(grads)
+    dist.all_reduce(flat)
+    for unflat, g in zip(_unflatten_dense_tensors(flat, grads), grads):
+        g.copy_(unflat)
+
 
 def train_batch(
     config: PretrainConfig,
@@ -409,20 +468,35 @@ def train_batch(
 
     batch = {k: v.cuda() for k, v in batch.items()}
 
-    if train_state.carry is None:
-        with torch.device("cuda"):
-            train_state.carry = train_state.model.initial_carry(batch)   # type: ignore
+    # Each batch is treated as an independent ACT episode for MRI: the
+    # carry is reset (all halted=True) and we then run the inner ACT loop
+    # until every sample in the batch has halted.  This decouples training
+    # from the upstream TRM "streaming" semantics, which only work when
+    # the same puzzle id can recur across batches.
+    with torch.device("cuda"):
+        carry = train_state.model.initial_carry(batch)   # type: ignore
 
-    train_state.carry, loss, metrics, _, _ = train_state.model(
-        carry=train_state.carry, batch=batch, return_keys=[]
-    )
+    accumulated_metrics: Optional[Dict[str, torch.Tensor]] = None
+    total_loss = batch["inputs"].new_zeros(())
 
-    ((1.0 / global_batch_size) * loss).backward()
+    max_inner_steps = 1024  # safety bound; halt_max_steps in config is normally << 1024
+    for _ in range(max_inner_steps):
+        carry, step_loss, step_metrics, _, all_finish = train_state.model(
+            carry=carry, batch=batch, return_keys=[]
+        )
+        total_loss = total_loss + step_loss
+        if accumulated_metrics is None:
+            accumulated_metrics = {k: v.detach().clone() for k, v in step_metrics.items()}
+        else:
+            for k, v in step_metrics.items():
+                accumulated_metrics[k] = accumulated_metrics[k] + v.detach()
+        if bool(all_finish):
+            break
+
+    ((1.0 / global_batch_size) * total_loss).backward()
 
     if world_size > 1:
-        for param in train_state.model.parameters():
-            if param.grad is not None:
-                dist.all_reduce(param.grad)
+        _coalesced_all_reduce_grads(train_state.model)
 
     lr_this_step = None
     for optim, base_lr in zip(train_state.optimizers, train_state.optimizer_lrs):
@@ -432,10 +506,9 @@ def train_batch(
         optim.step()
         optim.zero_grad()
 
-    if rank == 0 and metrics:
-        assert not any(v.requires_grad for v in metrics.values())
-        metric_keys   = sorted(metrics.keys())
-        metric_values = torch.stack([metrics[k] for k in metric_keys])
+    if rank == 0 and accumulated_metrics:
+        metric_keys   = sorted(accumulated_metrics.keys())
+        metric_values = torch.stack([accumulated_metrics[k] for k in metric_keys])
         if world_size > 1:
             dist.reduce(metric_values, dst=0)
         metric_values = metric_values.cpu().numpy()
@@ -445,7 +518,7 @@ def train_batch(
             if k == "count":
                 continue
             v = metric_values[i]
-            # Loss fields normalised by global_batch_size; others by count
+            # Loss fields normalised by global_batch_size; others by count.
             reduced[f"train/{k}"] = v / (global_batch_size if k.endswith("loss") else count)
         reduced["train/lr"] = lr_this_step
         return reduced
@@ -543,7 +616,7 @@ def save_code_and_config(config: PretrainConfig) -> None:
 # Main
 # ──────────────────────────────────────────────────────────────────────────────
 
-@hydra.main(config_path="config", config_name="cfg_pretrain", version_base=None)
+@hydra.main(config_path="config", config_name="cfg_mri_pretrain", version_base=None)
 def launch(hydra_config: DictConfig) -> None:
     RANK       = 0
     WORLD_SIZE = 1
@@ -558,8 +631,11 @@ def launch(hydra_config: DictConfig) -> None:
     torch.random.manual_seed(config.seed + RANK)
 
     train_epochs_per_iter = config.eval_interval if config.eval_interval else config.epochs
-    total_iters           = config.epochs // train_epochs_per_iter
-    assert config.epochs % train_epochs_per_iter == 0
+    # Round up so the configured `epochs` count is honoured exactly even when
+    # eval_interval doesn't divide it.  The previous strict-divisibility
+    # assert crashed for legitimate (epochs=50000, eval_interval=3000)-style
+    # configs that the upstream Samsung TRM accepted.
+    total_iters = (config.epochs + train_epochs_per_iter - 1) // train_epochs_per_iter
 
     train_loader, train_metadata = create_dataloader(
         config, "train", RANK, WORLD_SIZE,
@@ -628,7 +704,11 @@ def launch(hydra_config: DictConfig) -> None:
 
         # ── Checkpoint ─────────────────────────────────────────────────
         if RANK == 0 and (config.checkpoint_every_eval or _iter_id == total_iters - 1):
-            save_train_state(config, train_state_eval)
+            # Save the *training* state (live optimizer + live model), and
+            # the EMA shadows alongside, so resume reproduces both the live
+            # and EMA-evaluated trajectories.  train_state_eval may be a
+            # deep-copied EMA wrapper which would lose the live optimizer.
+            save_train_state(config, train_state, ema_helper=ema_helper)
 
         if config.ema and ema_helper:
             del train_state_eval

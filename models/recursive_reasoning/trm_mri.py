@@ -192,62 +192,70 @@ class ReasoningModule(nn.Module):
 # ──────────────────────────────────────────────────────────────────────────────
 
 def data_consistency(
-    image:          torch.Tensor,   # (B, H*W)  predicted image, float32
-    kspace_input:   torch.Tensor,   # (B, 2, H*W)  [real, imag] raw k-space input
-    mask:           torch.Tensor,   # (B, W)  1-D Cartesian mask
+    image:          torch.Tensor,            # (B, H*W)  predicted image, float32, in [0, 1] domain
+    kspace_input:   torch.Tensor,            # (B, 2, H*W)  [real, imag] observed k-space (un-normalised)
+    mask:           torch.Tensor,            # (B, W)  1-D Cartesian mask
     height:         int,
     width:          int,
+    scales:         Optional[torch.Tensor] = None,  # (B,) per-slice RSS max from build_mri_dataset
 ) -> torch.Tensor:
     """
-    Classic MRI data consistency in k-space:
-        pred_k = FFT(predicted_image)
+    Classic MRI data consistency, performed with **centred** FFTs to match
+    the convention used by `datasets.build_mri_dataset.build_mri_dataset`.
+
+        pred_k = centred_fft2(predicted_image)
         dc_k   = mask * k_observed  +  (1-mask) * pred_k
-        output = real(iFFT(dc_k))
+        output = real(centred_ifft2(dc_k))
 
     All ops in float32 for numerical stability.
-    Input and output shapes: (B, H*W).
 
-    Scale consistency:
-        kspace_input is raw (un-normalised) physical k-space.
-        image is in the same physical scale as label (normalised by RSS max).
-        The RSS label satisfies: label = iFFT(k_full) / scale,
-        so FFT(label) = k_full / scale.
-        We therefore must also divide kspace_input by the per-slice scale before
-        blending.  However, the scale is not passed here — so instead we normalise
-        kspace_input on the fly to match the energy of pred_k.  This is equivalent
-        to operating in the label's normalised domain.
+    Scale consistency
+    -----------------
+    The data builder writes `kspace_input = centred_fft2(label * scale) * mask`
+    where `label ∈ [0, 1]` is the normalised RSS image and `scale` is the
+    per-slice RSS max.  The model predicts in the same normalised domain as
+    `label`.  We therefore divide `kspace_input` by `scale` before blending,
+    so the observed and predicted k-spaces live on the same numerical scale.
+
+    If `scales` is not provided we fall back to the upstream behaviour of
+    energy-matching pred_k against the masked observed k-space, which is
+    less accurate but keeps DC well-defined when the dataset was built with
+    an older converter that did not write `all__scales.npy`.
     """
     B = image.shape[0]
 
     # Reshape predicted image to (B, H, W) for FFT
     pred_image_2d = image.view(B, height, width).to(torch.float32)
 
-    # FFT of predicted image  →  predicted k-space (complex)
-    pred_k = torch.fft.fft2(pred_image_2d)           # (B, H, W) complex64
+    # Centred FFT of predicted image  →  predicted k-space (complex)
+    pred_k_shifted = torch.fft.ifftshift(pred_image_2d, dim=(-2, -1))
+    pred_k = torch.fft.fftshift(torch.fft.fft2(pred_k_shifted), dim=(-2, -1))   # (B, H, W) complex
 
     # Reconstruct complex observed k-space from stored [real, imag] channels
     kspace_2d = kspace_input.view(B, 2, height, width).to(torch.float32)
-    obs_k = torch.complex(kspace_2d[:, 0], kspace_2d[:, 1])   # (B, H, W)
+    obs_k = torch.complex(kspace_2d[:, 0], kspace_2d[:, 1])                     # (B, H, W)
 
-    # Normalise observed k-space to match pred_k energy so they can be blended.
-    # We compute the scale as the ratio of RMS magnitudes over the observed lines.
-    # This is safe because there is always at least one observed line (center kept).
-    with torch.no_grad():
-        mask_2d = mask.view(B, 1, width).to(torch.float32)          # (B, 1, W)
-        obs_energy  = (obs_k.abs() * mask_2d).pow(2).mean(dim=(-2, -1), keepdim=True).sqrt().clamp_min(1e-8)
-        pred_energy = (pred_k.abs() * mask_2d).pow(2).mean(dim=(-2, -1), keepdim=True).sqrt().clamp_min(1e-8)
-        energy_ratio = (pred_energy / obs_energy)    # (B, 1, 1)
+    if scales is not None:
+        # Move observation into the normalised label domain (matches pred_k's scale)
+        scale_tensor = scales.to(torch.float32).view(B, 1, 1).clamp_min(1e-8)
+        obs_k_scaled = obs_k / scale_tensor
+    else:
+        # Fallback: on-the-fly RMS energy matching over the *observed* lines.
+        with torch.no_grad():
+            mask_2d_for_energy = mask.view(B, 1, width).to(torch.float32)
+            obs_energy  = (obs_k.abs() * mask_2d_for_energy).pow(2).mean(dim=(-2, -1), keepdim=True).sqrt().clamp_min(1e-8)
+            pred_energy = (pred_k.abs() * mask_2d_for_energy).pow(2).mean(dim=(-2, -1), keepdim=True).sqrt().clamp_min(1e-8)
+            energy_ratio = (pred_energy / obs_energy)                            # (B, 1, 1)
+        obs_k_scaled = obs_k * energy_ratio
 
-    # Scale obs_k to match pred_k magnitude
-    obs_k_scaled = obs_k * energy_ratio              # (B, H, W)
+    # Broadcast 1-D mask along H to a (B, H, W) blending mask
+    mask_2d = mask.view(B, 1, width).to(torch.float32).expand(B, height, width)
+    dc_k = mask_2d * obs_k_scaled + (1.0 - mask_2d) * pred_k
 
-    # Data consistency blend
-    mask_2d_hw = mask_2d.expand(B, height, width)    # (B, H, W)
-    dc_k = mask_2d_hw * obs_k_scaled + (1.0 - mask_2d_hw) * pred_k   # (B, H, W)
-
-    # iFFT  →  real image
-    dc_image = torch.fft.ifft2(dc_k).real            # (B, H, W)
-    return dc_image.reshape(B, height * width)        # (B, H*W)
+    # Centred iFFT  →  real image
+    dc_k_shifted = torch.fft.ifftshift(dc_k, dim=(-2, -1))
+    dc_image = torch.fft.fftshift(torch.fft.ifft2(dc_k_shifted), dim=(-2, -1)).real
+    return dc_image.reshape(B, height * width)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -301,9 +309,16 @@ class TinyRecursiveReasoningModel_MRI_Inner(nn.Module):
     # ── Carry helpers ──────────────────────────────────────────────────────
 
     def empty_carry(self, batch_size: int) -> TinyRecursiveReasoningModel_MRIInnerCarry:
+        # Use the device of an actually-allocated buffer (H_init) so the carry
+        # does not silently land on CPU when the model is on GPU.  Values are
+        # immediately overwritten by reset_carry on the first forward, but
+        # without `device=` torch.where in reset_carry would cross devices.
+        device = self.H_init.device
         return TinyRecursiveReasoningModel_MRIInnerCarry(
-            z_H=torch.empty(batch_size, self.seq_len, self.config.hidden_size, dtype=self.forward_dtype),
-            z_L=torch.empty(batch_size, self.seq_len, self.config.hidden_size, dtype=self.forward_dtype),
+            z_H=torch.empty(batch_size, self.seq_len, self.config.hidden_size,
+                            dtype=self.forward_dtype, device=device),
+            z_L=torch.empty(batch_size, self.seq_len, self.config.hidden_size,
+                            dtype=self.forward_dtype, device=device),
         )
 
     def reset_carry(
@@ -385,12 +400,17 @@ class TinyRecursiveReasoningModel_MRI_Inner(nn.Module):
 
         # ── Data consistency ─────────────────────────────────────────────
         # Runs in float32 even inside bfloat16 training for numerical stability.
+        # `scales` (per-slice RSS max from build_mri_dataset.py) lets DC blend
+        # observed and predicted k-space on the same numerical scale.  When
+        # the dataset was built without per-slice scales the field is absent
+        # and DC falls back to on-the-fly energy matching.
         pred_image = data_consistency(
             image=pred_image.to(torch.float32),
             kspace_input=batch["inputs"],          # (B, 2, H*W) raw k-space
             mask=batch["masks"],                   # (B, W)
             height=self.config.height,
             width=self.config.width,
+            scales=batch.get("scales"),
         ).to(self.forward_dtype)                   # back to training dtype
 
         # ── Q-head (mean pool over spatial positions) ────────────────────
@@ -474,6 +494,23 @@ class TinyRecursiveReasoningModel_MRI(nn.Module):
                     * torch.randint_like(new_steps, low=2, high=self.config.halt_max_steps + 1)
                 )
                 halted = halted & (new_steps >= min_halt)
+
+                # Bootstrap target for the Q-continue head when ACT_continue is
+                # enabled.  Mirrors the upstream TRM behaviour in trm.py:
+                # we re-run the inner model under no_grad to get the next
+                # state's Q-values, then take max(halt, continue) as the
+                # bootstrap target (or just halt at the terminal step).
+                if not self.config.no_ACT_continue:
+                    _, _, (next_q_halt_logits, next_q_continue_logits) = self.inner(
+                        new_inner_carry, new_current_data
+                    )
+                    outputs["target_q_continue"] = torch.sigmoid(
+                        torch.where(
+                            is_last_step,
+                            next_q_halt_logits,
+                            torch.maximum(next_q_halt_logits, next_q_continue_logits),
+                        )
+                    )
 
         return (
             TinyRecursiveReasoningModel_MRICarry(new_inner_carry, new_steps, halted, new_current_data),

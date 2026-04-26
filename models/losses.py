@@ -1,37 +1,79 @@
 """
-models/losses_mri.py
+models/losses.py
 
-MRI loss head wrapping TinyRecursiveReasoningModel_MRI.
-
-Differences from ACTLossHead in losses.py:
-  - Reconstruction loss  : MSE instead of cross-entropy
-  - Accuracy metric      : PSNR instead of exact-accuracy
-  - Q-halt target        : "is this prediction better than median?" (per-batch)
-  - Q-halt loss          : only computed over halted elements (correct supervision)
-  - No q_continue loss   : no_ACT_continue=True is assumed
+ACT loss head for the Samsung TRM ARC training pipeline.
+Mirrors the upstream TRM ACTLossHead so cfg_pretrain.yaml resolves correctly.
+For the MRI pipeline see models/losses_mri.py instead.
 """
 
 from __future__ import annotations
 
-import math
-from typing import Any, Dict, Optional, Sequence, Tuple
+from typing import Any, Dict, Sequence, Tuple
 
 import torch
 import torch.nn.functional as F
 from torch import nn
 
 
-class MRILossHead(nn.Module):
-    def __init__(self, model: nn.Module) -> None:
+IGNORE_LABEL_ID = -100
+
+
+def stablemax_cross_entropy(
+    logits: torch.Tensor,
+    labels: torch.Tensor,
+    ignore_index: int = IGNORE_LABEL_ID,
+) -> torch.Tensor:
+    """
+    Numerically stable cross-entropy with ignore_index masking.
+    Returns per-token loss with shape == labels.shape.
+    """
+    logits = logits.to(torch.float32)
+    valid_mask = (labels != ignore_index)
+    safe_labels = labels.clone()
+    safe_labels[~valid_mask] = 0
+    log_probs = F.log_softmax(logits, dim=-1)
+    nll = -log_probs.gather(-1, safe_labels.unsqueeze(-1).long()).squeeze(-1)
+    return nll * valid_mask.float()
+
+
+def softmax_cross_entropy(
+    logits: torch.Tensor,
+    labels: torch.Tensor,
+    ignore_index: int = IGNORE_LABEL_ID,
+) -> torch.Tensor:
+    """Standard cross-entropy with ignore_index masking. Per-token loss."""
+    return F.cross_entropy(
+        logits.flatten(0, -2).to(torch.float32),
+        labels.flatten().long(),
+        ignore_index=ignore_index,
+        reduction="none",
+    ).view(labels.shape)
+
+
+LOSS_FNS = {
+    "stablemax_cross_entropy": stablemax_cross_entropy,
+    "softmax_cross_entropy":   softmax_cross_entropy,
+}
+
+
+class ACTLossHead(nn.Module):
+    """
+    Wraps a TinyRecursiveReasoningModel_ACTV1 and produces:
+      - LM cross-entropy loss
+      - Q-halt BCE loss   (target = "is this prediction correct?")
+      - Q-continue BCE loss when no_ACT_continue=False
+    Returns (new_carry, total_loss, metrics, detached_outputs, all_finished).
+    """
+
+    def __init__(self, model: nn.Module, loss_type: str = "softmax_cross_entropy") -> None:
         super().__init__()
         self.model = model
-
-    # ── Carry delegation ────────────────────────────────────────────────────
+        if loss_type not in LOSS_FNS:
+            raise ValueError(f"Unknown loss_type: {loss_type!r}. Choose from {list(LOSS_FNS)}.")
+        self.loss_fn = LOSS_FNS[loss_type]
 
     def initial_carry(self, *args, **kwargs):
         return self.model.initial_carry(*args, **kwargs)
-
-    # ── Forward ─────────────────────────────────────────────────────────────
 
     def forward(
         self,
@@ -39,65 +81,60 @@ class MRILossHead(nn.Module):
         batch: Dict[str, torch.Tensor],
         return_keys: Sequence[str] = (),
     ) -> Tuple[Any, torch.Tensor, Dict[str, torch.Tensor], Dict[str, torch.Tensor], torch.Tensor]:
-        """
-        Returns
-        -------
-        new_carry, total_loss, metrics, detached_outputs, all_finished
-        """
-        # ── Model forward ────────────────────────────────────────────────
+
         new_carry, outputs = self.model(carry=carry, batch=batch)
 
-        pred_image   = outputs["pred_image"]      # (B, H*W)  float (training dtype)
-        target_image = new_carry.current_data["labels"].to(pred_image.dtype)  # (B, H*W)
+        labels = new_carry.current_data["labels"]
+        logits = outputs["logits"]
 
-        # ── Reconstruction loss (MSE, sum over batch for gradient scaling) ─
-        # pretrain.py scales by (1/global_batch_size), so we sum here.
-        mse_per_sample = F.mse_loss(pred_image, target_image, reduction="none").mean(dim=-1)  # (B,)
-        mse_loss       = mse_per_sample.sum()   # scalar
+        # ── LM loss (sum reduction; pretrain.py scales by 1/global_batch_size) ─
+        loss_per_token = self.loss_fn(logits, labels)
+        lm_loss = loss_per_token.sum()
 
-        # ── PSNR metric (halted elements only) ───────────────────────────
-        halted      = new_carry.halted                     # (B,) bool
-        valid_count = halted.sum().clamp_min(1)
-
+        # ── Token / sequence accuracy ─
         with torch.no_grad():
-            psnr_per_sample = 20.0 * torch.log10(
-                1.0 / (mse_per_sample.detach().clamp_min(1e-8)).sqrt()
-            )                                              # (B,)
+            valid_mask = (labels != IGNORE_LABEL_ID)
+            preds = logits.argmax(dim=-1)
+            correct_per_token = (preds == labels) & valid_mask
+            valid_per_seq     = valid_mask.sum(dim=-1).clamp_min(1)
+            seq_correct       = (correct_per_token.sum(dim=-1) == valid_per_seq)
 
-            psnr_sum = torch.where(halted, psnr_per_sample, torch.zeros_like(psnr_per_sample)).sum()
-            mse_sum  = torch.where(halted, mse_per_sample.detach(), torch.zeros_like(mse_per_sample)).sum()
-            steps_sum = torch.where(halted, new_carry.steps.float(), torch.zeros_like(new_carry.steps, dtype=torch.float32)).sum()
+            halted      = new_carry.halted
+            valid_count = halted.sum().clamp_min(1)
 
-        # ── Q-halt loss (halted elements only) ───────────────────────────
-        # Target: 1 if this sample is below-median MSE (good prediction), else 0.
-        # Only halted samples contribute — they have produced a final answer.
-        q_halt_logits = outputs["q_halt_logits"]           # (B,)
+            accuracy_sum = torch.where(halted, seq_correct.float(), torch.zeros_like(seq_correct, dtype=torch.float32)).sum()
+            steps_sum    = torch.where(halted, new_carry.steps.float(), torch.zeros_like(new_carry.steps, dtype=torch.float32)).sum()
 
+        # ── Q-halt loss ─
+        q_halt_logits = outputs["q_halt_logits"]
         with torch.no_grad():
-            median_mse = mse_per_sample.detach().median()
-            q_target   = (mse_per_sample.detach() < median_mse).float()   # (B,)
-            weight     = halted.float()                    # (B,)  0 or 1
-
+            q_halt_target = seq_correct.float()
+            weight        = halted.float()
         q_halt_loss = F.binary_cross_entropy_with_logits(
-            q_halt_logits, q_target, weight=weight, reduction="sum"
-        ) / weight.sum().clamp_min(1)
+            q_halt_logits, q_halt_target, weight=weight, reduction="sum"
+        )
 
-        # ── Total loss ───────────────────────────────────────────────────
-        total_loss = mse_loss + 0.5 * q_halt_loss
+        # ── Q-continue loss (only when ACT continue is enabled) ─
+        q_continue_loss = torch.zeros((), device=logits.device, dtype=torch.float32)
+        if "target_q_continue" in outputs:
+            q_continue_logits = outputs["q_continue_logits"]
+            q_continue_loss = F.binary_cross_entropy_with_logits(
+                q_continue_logits, outputs["target_q_continue"], weight=weight, reduction="sum"
+            )
 
-        # ── Metrics dict (all tensors, reduced in pretrain.py) ───────────
+        total_loss = lm_loss + 0.5 * q_halt_loss + 0.5 * q_continue_loss
+
         metrics: Dict[str, torch.Tensor] = {
-            "count":      valid_count.float(),
-            "mse":        mse_sum,
-            "psnr":       psnr_sum,
-            "steps":      steps_sum,
-            "mse_loss":   mse_loss.detach(),
+            "count":       valid_count.float(),
+            "accuracy":    accuracy_sum,
+            "steps":       steps_sum,
+            "lm_loss":     lm_loss.detach(),
             "q_halt_loss": q_halt_loss.detach(),
         }
+        if "target_q_continue" in outputs:
+            metrics["q_continue_loss"] = q_continue_loss.detach()
 
-        # ── Detach selected outputs for evaluators / logging ─────────────
         detached_outputs = {k: outputs[k].detach() for k in return_keys if k in outputs}
-
         all_finished: torch.Tensor = new_carry.halted.all()
 
         return new_carry, total_loss, metrics, detached_outputs, all_finished

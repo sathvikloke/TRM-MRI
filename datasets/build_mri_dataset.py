@@ -4,22 +4,37 @@ dataset/build_mri_dataset.py
 Converts raw fastMRI .h5 files into .npy arrays consumed by the MRI training pipeline.
 
 Output layout (one directory per split, e.g. data/mri-knee/train/):
-    all__inputs.npy   float32  (N, 2, H*W)   — real & imag of masked k-space, NOT normalised
+    all__inputs.npy   float32  (N, 2, H*W)   — real & imag of masked k-space (single-coil-equivalent)
     all__labels.npy   float32  (N, H*W)       — RSS magnitude image, normalised to [0, 1]
     all__masks.npy    float32  (N, W)          — 1-D Cartesian undersampling mask
     all__scales.npy   float32  (N,)            — per-slice RSS max used for label normalisation
     dataset.json                               — MRIDatasetMetadata
 
-Why raw (un-normalised) k-space as input?
-------------------------------------------
-Data consistency enforces:  dc_k = mask * k_obs + (1 - mask) * FFT(pred_image)
+Convention notes
+----------------
+fastMRI k-space is "centred" — the DC component sits at index (H/2, W/2).
+NumPy's `np.fft.ifft2` expects the DC at the corner, so we have to do:
 
-For this to work both sides must live in the same physical scale.
-The label RSS image is the iFFT of the FULLY-SAMPLED k-space, normalised by its own
-max pixel value (stored in all__scales.npy so the model can invert it if needed).
-The raw k-space naturally satisfies:  max(|iFFT(k)|) == scale,
-so the model can learn to predict images in [0,1] and the FFT of those predictions
-will sit in the right numerical range for data-consistency blending.
+        image = fftshift(ifft2(ifftshift(kspace)))
+
+The previous version of this file applied `ifftshift` *after* `ifft2`, which
+silently produced shifted (and therefore wrong) images.
+
+Multi-coil handling
+-------------------
+For multi-coil data the per-coil iFFT is RSS-combined to give the magnitude
+target.  Because the model emits a single (1-channel) magnitude image we
+also build a "virtual single-coil" k-space, defined as `fft2(rss_image)`,
+masked the same way the multi-coil acquisition was masked.  This lets the
+model's data-consistency block blend its prediction against an observation
+that lives in the same physical scale as the prediction itself.
+
+Per-slice reproducibility
+-------------------------
+Each slice's undersampling mask is drawn from its own `np.random.Generator`,
+seeded as `seed XOR <global slice index>`.  This keeps mask draws stable
+under parallelism / re-orderings and is independent of how many other
+slices were processed before this one.
 
 Usage:
     python -m datasets.build_mri_dataset \\
@@ -80,29 +95,47 @@ cli = ArgParser()
 # MRI physics helpers
 # ──────────────────────────────────────────────────────────────
 
+def _centred_ifft2(kspace: np.ndarray) -> np.ndarray:
+    """
+    Centred 2-D inverse FFT.
+
+    Assumes DC is at the centre of the input k-space (fastMRI convention).
+    Returns the complex image with DC again at the centre.
+    """
+    shifted = np.fft.ifftshift(kspace, axes=(-2, -1))
+    image = np.fft.ifft2(shifted, axes=(-2, -1))
+    return np.fft.fftshift(image, axes=(-2, -1))
+
+
+def _centred_fft2(image: np.ndarray) -> np.ndarray:
+    """Centred 2-D forward FFT — inverse of `_centred_ifft2`."""
+    shifted = np.fft.ifftshift(image, axes=(-2, -1))
+    k = np.fft.fft2(shifted, axes=(-2, -1))
+    return np.fft.fftshift(k, axes=(-2, -1))
+
+
 def rss_reconstruction(kspace: np.ndarray) -> Tuple[np.ndarray, float]:
     """
-    Compute Root-Sum-of-Squares image from (coils, H, W) complex k-space.
-    Returns (image_normalised, scale) where image_normalised ∈ [0, 1].
+    Compute the Root-Sum-of-Squares image from k-space.
 
-    Single-coil input (H, W) is handled by inserting a dummy coil dim.
+    Input shape:
+        (coils, H, W) complex   – multi-coil
+        (H, W)        complex   – single-coil (treated as 1-coil RSS)
 
-    The scale is the pre-normalisation max pixel value; storing it allows
-    the model to reconstruct absolute pixel intensities if needed.
+    Returns
+    -------
+    rss_normalised : (H, W) float32 in [0, 1]
+    scale          : float, the pre-normalisation max used to scale rss
     """
     if kspace.ndim == 2:
-        kspace = kspace[np.newaxis]          # (1, H, W)
+        kspace = kspace[np.newaxis]              # (1, H, W)
 
-    # iFFT each coil  →  complex image
-    images = np.fft.ifft2(kspace, axes=(-2, -1))
-    images = np.fft.ifftshift(images, axes=(-2, -1))
-
-    # RSS combination across coils
-    rss = np.sqrt((np.abs(images) ** 2).sum(axis=0)).astype(np.float32)   # (H, W)
+    images = _centred_ifft2(kspace)              # complex (coils, H, W)
+    rss = np.sqrt((np.abs(images) ** 2).sum(axis=0)).astype(np.float32)
 
     scale = float(rss.max())
     if scale > 0:
-        rss /= scale
+        rss = rss / scale
 
     return rss, scale
 
@@ -126,45 +159,29 @@ def build_cartesian_mask(width: int, acceleration: int, center_fraction: float,
     mask[c_start: c_start + num_center] = 1.0
 
     # Random peripheral lines
-    peripheral = [i for i in range(width) if mask[i] == 0.0]
-    if num_random > 0 and len(peripheral) >= num_random:
+    peripheral = np.flatnonzero(mask == 0.0)
+    if num_random > 0 and peripheral.size >= num_random:
         chosen = rng.choice(peripheral, size=num_random, replace=False)
         mask[chosen] = 1.0
 
     return mask
 
 
-def apply_mask(kspace: np.ndarray, mask: np.ndarray) -> np.ndarray:
+def kspace_to_input(virtual_kspace_masked: np.ndarray) -> np.ndarray:
     """
-    Zero out k-space lines where mask == 0.
-    kspace: (coils, H, W) complex  OR  (H, W) complex
-    mask:   (W,) float
-    Broadcasting zeros entire columns.
+    Convert (H, W) complex masked k-space → model input array (2, H*W).
+    Channel 0 is real, channel 1 is imaginary, both row-major flattened.
+
+    NOTE: values are NOT renormalised — raw magnitudes are preserved so that
+    the model's data-consistency block can blend predicted vs. observed
+    k-space at a matching physical scale.
     """
-    return kspace * mask   # numpy broadcasts (W,) over (..., H, W) correctly
-
-
-def kspace_to_input(kspace_masked: np.ndarray) -> np.ndarray:
-    """
-    Convert masked complex k-space → model input array of shape (2, H*W).
-    Channel 0: real part (flattened, row-major)
-    Channel 1: imaginary part (flattened, row-major)
-
-    NOTE: values are NOT normalised here — raw k-space magnitudes are preserved
-    so that data_consistency() inside the model can blend predicted and observed
-    k-space on a matching physical scale.
-    """
-    if kspace_masked.ndim == 3:
-        # Multi-coil: sum across coils before splitting real/imag.
-        # Simple coil combination in k-space; adequate for a prototype.
-        combined = kspace_masked.sum(axis=0)          # (H, W) complex
-    else:
-        combined = kspace_masked                       # (H, W) complex
-
-    real_part = combined.real.astype(np.float32).reshape(-1)   # (H*W,)
-    imag_part = combined.imag.astype(np.float32).reshape(-1)   # (H*W,)
-
-    return np.stack([real_part, imag_part], axis=0)            # (2, H*W)
+    assert virtual_kspace_masked.ndim == 2, (
+        f"Expected (H, W) input, got shape {virtual_kspace_masked.shape}"
+    )
+    real_part = virtual_kspace_masked.real.astype(np.float32).reshape(-1)
+    imag_part = virtual_kspace_masked.imag.astype(np.float32).reshape(-1)
+    return np.stack([real_part, imag_part], axis=0)
 
 
 # ──────────────────────────────────────────────────────────────
@@ -175,17 +192,28 @@ def load_h5_slices(filepath: str) -> List[np.ndarray]:
     """
     Load all axial slices from a fastMRI .h5 file.
     Returns a list of complex arrays, each of shape (coils, H, W) or (H, W).
+
+    Handles both:
+        * native complex-typed datasets (preferred fastMRI format)
+        * structured-dtype legacy storage with {"r", "i"} fields
     """
     with h5py.File(filepath, "r") as f:
+        if "kspace" not in f:
+            raise KeyError(f"{filepath!r} does not contain a 'kspace' dataset")
         kspace = f["kspace"][:]    # (slices, [coils,] H, W)
 
-    # Handle structured dtype (some HDF5 files store complex as {r, i} fields)
     if kspace.dtype.names is not None and {"r", "i"}.issubset(set(kspace.dtype.names)):
-        kspace = kspace["r"] + 1j * kspace["i"]
+        kspace = kspace["r"].astype(np.float32) + 1j * kspace["i"].astype(np.float32)
 
     kspace = kspace.astype(np.complex64)
 
-    # Return one array per slice
+    # Sanity check on rank: expect (S, H, W) or (S, C, H, W).
+    if kspace.ndim not in (3, 4):
+        raise ValueError(
+            f"{filepath!r}: unexpected kspace rank {kspace.ndim}, "
+            f"shape={kspace.shape}; expected 3 (single-coil) or 4 (multi-coil)."
+        )
+
     return [kspace[sl] for sl in range(kspace.shape[0])]
 
 
@@ -193,14 +221,19 @@ def load_h5_slices(filepath: str) -> List[np.ndarray]:
 # Per-split conversion
 # ──────────────────────────────────────────────────────────────
 
+def _slice_rng(seed: int, slice_index: int) -> np.random.Generator:
+    """Per-slice deterministic RNG, independent of file ordering."""
+    return np.random.default_rng(np.random.SeedSequence([seed, slice_index]))
+
+
 def convert_subset(
     set_name: str,
     h5_files: List[str],
     config: DataProcessConfig,
-    rng: np.random.Generator,
     max_slices: Optional[int],
     height: int,
     width: int,
+    base_slice_index: int,
 ) -> int:
     """
     Process a list of .h5 files and write the .npy arrays for one split.
@@ -216,9 +249,10 @@ def convert_subset(
 
     skipped = 0
     total   = 0
+    is_multicoil = False
+    global_index = base_slice_index
 
     for filepath in tqdm(h5_files, desc=f"Processing {set_name}"):
-        file_id = Path(filepath).stem
         try:
             slices = load_h5_slices(filepath)
         except Exception as exc:
@@ -229,25 +263,37 @@ def convert_subset(
             if max_slices is not None and total >= max_slices:
                 break
 
-            # Determine spatial dims (last two axes)
+            # Spatial dims (last two axes)
             h, w = sl_kspace.shape[-2], sl_kspace.shape[-1]
 
             # Enforce consistent spatial size across all files
             if h != height or w != width:
                 skipped += 1
+                global_index += 1
                 continue
+
+            if sl_kspace.ndim == 3:
+                is_multicoil = True
 
             # ── Ground-truth label (fully-sampled RSS image) ──────────────
             label_image, scale = rss_reconstruction(sl_kspace)   # (H, W) ∈ [0,1]
 
-            # ── Random Cartesian mask for this slice ──────────────────────
-            mask = build_cartesian_mask(width, config.acceleration, config.center_fraction, rng)
+            # ── Random Cartesian mask, deterministic per global slice index
+            slice_rng = _slice_rng(config.seed, global_index)
+            mask = build_cartesian_mask(width, config.acceleration, config.center_fraction, slice_rng)
 
-            # ── Apply mask to k-space ─────────────────────────────────────
-            kspace_masked = apply_mask(sl_kspace, mask)
+            # ── Virtual single-coil k-space matching the magnitude target ──
+            # Using FFT(label) * scale ensures that data-consistency in the
+            # training loop sees observations on the same scale as the
+            # network prediction (which lives in [0, 1]).  We multiply by
+            # `scale` so that the saved k-space recovers the *un-normalised*
+            # magnitude image when the model multiplies its prediction by
+            # `scale`.
+            virtual_kspace = _centred_fft2(label_image.astype(np.complex64) * scale)
+            virtual_kspace_masked = virtual_kspace * mask          # (H, W) complex
 
             # ── Convert to model input ────────────────────────────────────
-            inp = kspace_to_input(kspace_masked)   # (2, H*W)
+            inp = kspace_to_input(virtual_kspace_masked)
 
             inputs_list.append(inp)
             labels_list.append(label_image.reshape(-1).astype(np.float32))   # (H*W,)
@@ -255,6 +301,7 @@ def convert_subset(
             scales_list.append(scale)
 
             total += 1
+            global_index += 1
 
         if max_slices is not None and total >= max_slices:
             break
@@ -276,16 +323,6 @@ def convert_subset(
             np.stack(masks_list,  axis=0).astype(np.float32))   # (N, W)
     np.save(os.path.join(save_dir, "all__scales.npy"),
             np.array(scales_list, dtype=np.float32))             # (N,)
-
-    # Metadata
-    is_multicoil = False
-    if h5_files:
-        try:
-            sample_slices = load_h5_slices(h5_files[0])
-            if sample_slices and sample_slices[0].ndim == 3:
-                is_multicoil = True
-        except Exception:
-            pass
 
     metadata = MRIDatasetMetadata(
         height=height,
@@ -327,17 +364,18 @@ def _infer_spatial_size(files: List[str]) -> Tuple[int, int]:
 
 
 def convert_dataset(config: DataProcessConfig) -> None:
-    rng = np.random.default_rng(config.seed)
+    # Use a top-level RNG only for the train/test file split.  Per-slice
+    # mask sampling uses its own RNG keyed on (seed, slice_index).
+    split_rng = np.random.default_rng(config.seed)
 
-    # Discover all .h5 files
     all_files = _discover_h5_files(config.input_dir)
     print(f"Found {len(all_files)} .h5 files in {config.input_dir}")
 
-    # Infer spatial size from first file
     height, width = _infer_spatial_size(all_files)
 
-    # Train / test split (file-level, not slice-level)
-    rng.shuffle(all_files)  # in-place shuffle
+    # Train / test split (file-level, deterministic permutation).
+    perm = split_rng.permutation(len(all_files))
+    all_files = [all_files[i] for i in perm]
     n_test  = max(1, int(round(len(all_files) * config.test_fraction)))
     n_train = len(all_files) - n_test
     train_files = all_files[:n_train]
@@ -345,12 +383,19 @@ def convert_dataset(config: DataProcessConfig) -> None:
 
     print(f"Split: {n_train} train files, {n_test} test files")
 
-    convert_subset("train", train_files, config, rng,
-                   max_slices=config.max_train_slices,
-                   height=height, width=width)
-    convert_subset("test",  test_files,  config, rng,
-                   max_slices=config.max_test_slices,
-                   height=height, width=width)
+    n_train_slices = convert_subset(
+        "train", train_files, config,
+        max_slices=config.max_train_slices,
+        height=height, width=width,
+        base_slice_index=0,
+    )
+    convert_subset(
+        "test", test_files, config,
+        max_slices=config.max_test_slices,
+        height=height, width=width,
+        # Offset so train and test slice rng streams never collide.
+        base_slice_index=n_train_slices + 10**6,
+    )
 
 
 @cli.command(singleton=True)
